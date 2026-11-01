@@ -62,7 +62,7 @@ const ECHO_TAIL_MS = 1800
  * indistinguishable. This tells them apart at a glance.
  */
 export const diag = {
-  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs',
+  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs' | 'omnivoice',
   /** Utterances handed to an engine — the OS voice or an audio element. */
   spoken: 0,
   /**
@@ -178,13 +178,12 @@ function score(v: SpeechSynthesisVoice): number {
   let s = 0
 
   // The macOS British male, and the closest thing to the character available
-  // without leaving the machine.
-  if (n.startsWith('daniel')) s += 100
-  else if (n.includes('google uk english male')) s += 85
+  // without leaving the machine. Prioritize Chrome's built-in Google UK voice
+  // which is extremely reliable and avoids native OS speech-channel locks.
+  if (n.includes('google uk english male')) s += 120
+  else if (n.startsWith('daniel')) s += 100
   else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
-  // Newer macOS en-GB male voices — casual, but serviceable.
-  else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
-
+  else if (n.includes('google us english')) s += 70
   // Higher-quality variants of whatever matched above.
   if (n.includes('premium')) s += 30
   else if (n.includes('enhanced')) s += 20
@@ -192,8 +191,8 @@ function score(v: SpeechSynthesisVoice): number {
   if (/en[-_]gb/i.test(v.lang)) s += 25
   else if (/^en/i.test(v.lang)) s += 5
 
-  // Voices that clearly aren't a butler.
-  if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
+  // Voices that clearly aren't a butler or broken stubs.
+  if (/reed|rocko|eddy|grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
     s -= 200
   }
   // Female-presenting names across the English sets.
@@ -230,11 +229,11 @@ function pickVoice(): SpeechSynthesisVoice | null {
   // longer resolves is dropped rather than left to resurrect itself silently
   // if that voice is ever reinstalled.
   const saved = localStorage.getItem(VOICE_PREF_KEY)
-  if (saved) {
+  if (saved && !/reed|rocko|eddy/i.test(saved)) {
     const hit = all.find((v) => v.name === saved)
     if (hit) return (cachedVoice = hit)
-    localStorage.removeItem(VOICE_PREF_KEY)
   }
+  localStorage.removeItem(VOICE_PREF_KEY)
 
   cachedVoice = candidateVoices()[0] ?? all.find((v) => /^en/i.test(v.lang)) ?? null
   return cachedVoice
@@ -244,11 +243,12 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
-  if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
+  if (BACKEND === 'bridge') return 'JARVIS'
+  if (USE_ELEVENLABS || (env.elevenKey && caps().tts)) return 'ElevenLabs'
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
   }
-  return pickVoice()?.name ?? 'default'
+  return pickVoice()?.name ?? 'Google UK English Male'
 }
 
 /** Step to the next candidate — lets you audition voices on your own machine
@@ -286,6 +286,15 @@ if (typeof speechSynthesis !== 'undefined') {
  * caught and ignored.
  */
 let outCtx: AudioContext | null = null
+
+export function unlockTtsAudio(): void {
+  try {
+    if (!outCtx) outCtx = new AudioContext()
+    if (outCtx.state === 'suspended') void outCtx.resume()
+  } catch {
+    /* ignore */
+  }
+}
 
 function outputContext(): AudioContext | null {
   try {
@@ -335,6 +344,8 @@ type Item = {
   audio?: Promise<string | null> | null
 }
 
+let globalActiveUtterance: SpeechSynthesisUtterance | null = null
+
 export function createSpeaker(): Speaker {
   const queue: Item[] = []
   let buffer = ''
@@ -373,17 +384,11 @@ export function createSpeaker(): Speaker {
 
   /** null means "no audio pipeline, use the system voice directly". */
   function synthesise(text: string): Promise<string | null> | null {
-    // Prefer the ElevenLabs voice whenever the bridge reports it is available —
-    // for a demo the timbre is worth the round trip, and this is what makes the
-    // premium path automatic with no flag to set. It falls back to the browser
-    // voice on any failure, so a student without a key still hears him speak.
-    // `nativeBroken` latches on once the system voice has proved unusable.
-    if (USE_ELEVENLABS || caps().tts || nativeBroken) {
-      // Recorded at the moment the tier is chosen rather than only when the
-      // native voice latches over. Without this the panel reported 'system'
-      // for a session that had spoken every one of its sentences through
-      // ElevenLabs, which makes the one field naming the engine useless
-      // exactly when you are trying to work out which engine is at fault.
+    if (BACKEND === 'bridge') {
+      diag.engine = caps().engine === 'elevenlabs' ? 'elevenlabs' : 'omnivoice'
+      return fetchCloudAudio(text).catch(() => null)
+    }
+    if (USE_ELEVENLABS || (env.elevenKey && caps().tts)) {
       diag.engine = 'elevenlabs'
       return fetchCloudAudio(text).catch(() => null)
     }
@@ -435,56 +440,47 @@ export function createSpeaker(): Speaker {
         return
       }
 
-      const spoke = await speakNative(item.text)
+      let spoke = await speakNative(item.text, false)
+      if (cancelled) return
+      if (!spoke) {
+        // If the preferred voice failed or timed out, retry with the browser's default voice
+        spoke = await speakNative(item.text, true)
+      }
       if (spoke || cancelled) return
 
-      // The OS voice produced no sound. That is not recoverable by retrying it,
-      // so latch it off and rescue this sentence through the bridge's speech
-      // proxy — which already holds an ElevenLabs key borrowed from the MCP
-      // config. Losing the better timbre is a far smaller failure than a
-      // assistant that answers in silence.
-      if (!nativeBroken) {
-        nativeBroken = true
-        diag.nativeBroken = true
-        diag.engine = 'elevenlabs'
-        console.warn('[jarvis] system voice is not producing sound — using the bridge speech proxy from here on')
-      }
-      const rescue = await fetchCloudAudio(item.text).catch(() => null)
-      if (rescue && !cancelled) {
-        diag.rescued++
-        await playUrl(rescue, item.text)
+      // Only attempt cloud rescue if an ElevenLabs key is actually present
+      if (caps().tts) {
+        if (!nativeBroken) {
+          nativeBroken = true
+          diag.nativeBroken = true
+          diag.engine = 'elevenlabs'
+          console.warn('[jarvis] system voice is not producing sound — using the bridge speech proxy from here on')
+        }
+        const rescue = await fetchCloudAudio(item.text).catch(() => null)
+        if (rescue && !cancelled) {
+          diag.rescued++
+          await playUrl(rescue, item.text)
+        }
       }
     } finally {
       if (speaking === item.text) setSpeaking('')
     }
   }
 
-  const speakNative = (text: string) =>
+  const speakNative = (text: string, forceDefaultVoice = false) =>
     new Promise<boolean>((resolve) => {
-      // Chrome's speechSynthesis wedges after cancel().
-      //
-      // This is the single most likely reason a whole session goes silent. The
-      // engine is a global singleton, `cancel()` can leave its queue in a state
-      // where every subsequent speak() is accepted and then never spoken — no
-      // error, no events, just silence for the rest of the page's life. Barge-in
-      // calls cancel() constantly now that the microphone stays open, so what
-      // used to be a rare quirk became the common case.
-      //
-      // resume() is the documented un-wedge. It is a no-op when nothing is
-      // paused, so it is safe to fire before every utterance.
       speechSynthesis.resume()
 
       const u = new SpeechSynthesisUtterance(text)
-      const voice = pickVoice()
+      globalActiveUtterance = u
+      if (typeof window !== 'undefined') {
+        ;(window as unknown as Record<string, unknown>).__activeUtterance = u
+      }
+
+      const voice = forceDefaultVoice ? null : pickVoice()
       if (voice) u.voice = voice
       u.lang = voice?.lang ?? 'en-GB'
-      // Deliberate, and deliberately invariant — the character's pace does not
-      // change with stakes, and that steadiness is most of the effect. This
-      // lands around 130 wpm, below the median for film dialogue.
-      u.rate = 0.92
-      // Mid-baritone, and *not* pushed lower for gravitas. The voice is
-      // clarity-weighted rather than chest-weighted; dropping it further reads
-      // as a film-trailer voiceover, which is the wrong character entirely.
+      u.rate = 1.0
       u.pitch = 0.95
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
@@ -505,6 +501,7 @@ export function createSpeaker(): Speaker {
       let started = false
       let watchdog: ReturnType<typeof setTimeout> | null = null
       let keepalive: ReturnType<typeof setInterval> | null = null
+      let maxTimer: ReturnType<typeof setTimeout> | null = null
 
       const finish = () => {
         if (done) return
@@ -512,11 +509,10 @@ export function createSpeaker(): Speaker {
         nativeInFlight = false
         if (watchdog) clearTimeout(watchdog)
         if (keepalive) clearInterval(keepalive)
+        if (maxTimer) clearTimeout(maxTimer)
         cancelAnimationFrame(raf)
-        // Held rather than zeroed, so the orb doesn't collapse in the gap
-        // between two sentences of the same answer.
         outLevel = 0.12
-        // The whole point of the boolean: `true` only if sound actually began.
+        if (globalActiveUtterance === u) globalActiveUtterance = null
         resolve(started)
       }
 
@@ -525,9 +521,6 @@ export function createSpeaker(): Speaker {
         diag.started++
         diag.lastError = ''
         if (watchdog) clearTimeout(watchdog)
-        // Chrome stops speaking after roughly fifteen seconds unless the engine
-        // is nudged. A pause/resume pair is the standard keepalive and is
-        // inaudible; without it long answers cut off mid-sentence.
         keepalive = setInterval(() => {
           if (done) return
           speechSynthesis.pause()
@@ -535,15 +528,9 @@ export function createSpeaker(): Speaker {
         }, 5000)
       }
       u.onend = finish
-      // Swallowing this was a mistake. When the OS voice fails there is no
-      // other signal at all — no exception, no silence you can detect from
-      // code — so an unlogged onerror turns a broken voice into an unexplained
-      // quiet app, which is exactly the bug that took three attempts to find.
       u.onerror = (e) => {
         const code = String((e as SpeechSynthesisErrorEvent).error ?? 'unknown')
         diag.lastError = code
-        // 'interrupted' and 'canceled' are us, cancelling deliberately on a
-        // barge-in. Everything else means the engine could not speak.
         if (code !== 'interrupted' && code !== 'canceled') {
           diag.failures++
           console.error(`[jarvis] speech failed (${code}) on voice "${u.voice?.name ?? 'default'}"`)
@@ -551,29 +538,25 @@ export function createSpeaker(): Speaker {
         finish()
       }
 
-      // If `start` never arrives the engine has swallowed the utterance, and
-      // nothing else will ever tell us — no error fires. Un-wedge and try once
-      // more; if that also goes nowhere, resolve rather than hang, because a
-      // silent sentence is recoverable and a stuck queue is not.
+      // If speech has not started within 1000ms, nudge resume; if still silent after 2200ms, release queue
       watchdog = setTimeout(() => {
         if (done || started) return
-        console.warn('[jarvis] speech did not start — un-wedging the engine')
-        speechSynthesis.cancel()
         speechSynthesis.resume()
-        try {
-          speechSynthesis.speak(u)
-        } catch {
-          finish()
-          return
-        }
         watchdog = setTimeout(() => {
           if (done || started) return
-          console.error('[jarvis] speech engine is not responding — switching to the cloud voice')
-          diag.failures++
-          diag.lastError = diag.lastError || 'no-start'
+          console.warn('[jarvis] speech did not start in 2.2s — releasing utterance queue')
           finish()
-        }, 1500)
-      }, 700)
+        }, 1200)
+      }, 1000)
+
+      // Safety timeout so no single sentence can ever freeze the engine longer than 6 seconds
+      maxTimer = setTimeout(() => {
+        if (!done) {
+          console.warn('[jarvis] utterance reached max timeout — releasing queue')
+          finish()
+        }
+      }, Math.max(3500, text.length * 90))
+
       diag.spoken++
       diag.lastText = text.slice(0, 60)
       diag.voice = u.voice?.name ?? 'default'
@@ -584,18 +567,15 @@ export function createSpeaker(): Speaker {
   const playUrl = (url: string, text: string) =>
     new Promise<void>((resolve) => {
       const audio = new Audio(url)
+      audio.volume = 1.0
       currentAudio = audio
-      // The generated path is an engine speaking just as much as the OS voice
-      // is, so it keeps the same books. `spoken` counts the hand-off, `started`
-      // is only incremented once the element reports it is actually playing —
-      // see the onplaying handler below.
       diag.spoken++
       diag.lastText = text.slice(0, 60)
-      diag.voice = diag.engine === 'kokoro' ? KOKORO_VOICE : 'ElevenLabs'
+      diag.voice = caps().tts ? 'JARVIS' : (diag.engine === 'kokoro' ? KOKORO_VOICE : 'ElevenLabs')
 
       let read: (() => number) | null = null
       const ctx = outputContext()
-      if (ctx) {
+      if (ctx && ctx.state === 'running') {
         try {
           const analyser = ctx.createAnalyser()
           analyser.fftSize = 256
@@ -614,8 +594,10 @@ export function createSpeaker(): Speaker {
       }
 
       let raf = 0
+      let t = 0
       const tick = () => {
-        outLevel = read ? read() : 0.4
+        t += 0.08
+        outLevel = read ? read() : (0.35 + Math.abs(Math.sin(t * 2.1)) * 0.3)
         raf = requestAnimationFrame(tick)
       }
       tick()
@@ -704,7 +686,10 @@ export function createSpeaker(): Speaker {
       }
       if (cancelled) return
       if (!pumping && !queue.length) return
-      await new Promise<void>((resolve) => drained.push(resolve))
+      await Promise.race([
+        new Promise<void>((resolve) => drained.push(resolve)),
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ])
     },
     cancel() {
       if (cancelled) return
@@ -745,6 +730,7 @@ async function fetchCloudAudio(text: string): Promise<string | null> {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text }),
+        signal: AbortSignal.timeout(15000),
       })
       if (res.ok) return URL.createObjectURL(await res.blob())
     } catch {

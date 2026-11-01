@@ -6,7 +6,7 @@ import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
 import { startVoice, type Voice, type VoiceMode } from './lib/voice'
-import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
+import { createSpeaker, cycleVoice, currentVoiceName, unlockTtsAudio } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
@@ -30,7 +30,7 @@ import {
   type Msg,
 } from './lib/brain'
 import { startAnalyser, micLevel } from './lib/audio'
-import { probeCapabilities } from './lib/capabilities'
+import { probeCapabilities, caps } from './lib/capabilities'
 import { env } from './config'
 
 /**
@@ -64,10 +64,10 @@ const newId = () =>
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
 const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
-/** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+/** A bare vocative — "Jarvis", "hey jarvis", "hello jarvis" — with nothing asked. */
+const BARE_NAME = new RegExp(`^(?:hey|hi|hello|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
+/** A leading vocative on a real command: "Jarvis, what's the weather", "hello jarvis, what is the weather". */
+const LEADING_NAME = new RegExp(`^(?:hey|hi|hello|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
 
 export default function App() {
   const store = useStore
@@ -184,6 +184,15 @@ export default function App() {
 
       if (stale()) return
 
+      if (!started && text) {
+        started = true
+        store.getState().setPhase('speaking')
+        store.getState().setActiveTool(null)
+        music.working(false)
+        store.getState().pushTurn({ id: turnId, role: 'jarvis', text })
+        spk.say(text)
+      }
+
       // The bridge keeps conversation state in its own session, so history is
       // only threaded through on the direct path.
       if (!usingBridge) {
@@ -205,14 +214,12 @@ export default function App() {
         .getState()
         .setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
-      if (!stale()) {
-        speaker.current = null
-        sfx.duck(false)
-        music.duck(false)
-        store.getState().setActiveTool(null)
-        music.working(false)
-        // Stay open. Having to say his name again to add one more sentence is
-        // the difference between a conversation and a vending machine.
+      speaker.current = null
+      sfx.duck(false)
+      music.duck(false)
+      store.getState().setActiveTool(null)
+      music.working(false)
+      if (!stale() || store.getState().phase === 'thinking') {
         listen(FOLLOW_UP_MS)
       }
     }
@@ -293,9 +300,13 @@ export default function App() {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
 
-    // People keep using his name as a vocative once they're already talking to
-    // him. Strip it rather than sending "jarvis" to the model as a question.
+    // People keep using his name as a vocative ("hey jarvis", "hello jarvis").
+    // Acknowledge immediately with an attention phrase instead of sending bare name to model.
     if (BARE_NAME.test(text)) {
+      const greeting = createSpeaker()
+      speaker.current = greeting
+      greeting.say(attention())
+      void greeting.end()
       listen(AWAIT_SPEECH_MS)
       return
     }
@@ -352,6 +363,14 @@ export default function App() {
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
     await sfx.unlockAudio()
+    unlockTtsAudio()
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+      window.speechSynthesis.resume()
+      const dummy = new SpeechSynthesisUtterance(' ')
+      dummy.volume = 0.05
+      window.speechSynthesis.speak(dummy)
+    }
     sfx.play('boot')
     // The score. Must be started from inside this click handler for the same
     // reason as the rest of the audio.
@@ -449,6 +468,12 @@ export default function App() {
           console.warn('[jarvis] unknown ui op:', op, args)
       }
     })
+    if (typeof localStorage !== 'undefined') {
+      const v = localStorage.getItem('jarvis.voice')
+      if (v && /reed|rocko|eddy/i.test(v)) {
+        localStorage.removeItem('jarvis.voice')
+      }
+    }
     // In bridge mode the conversation lives in the agent session, which is tied
     // to the socket — so a drop silently wipes his memory while the transcript
     // on screen still shows it. Better to say so than to let him quietly forget.
@@ -459,8 +484,19 @@ export default function App() {
         store
           .getState()
           .setError('Bridge reconnected. The previous conversation was not kept.')
+        void probeCapabilities().then(() => store.getState().setVoice(currentVoiceName()))
+      } else if (state === 'open') {
+        void probeCapabilities().then(() => store.getState().setVoice(currentVoiceName()))
       }
     })
+    void probeCapabilities().then(() => store.getState().setVoice(currentVoiceName()))
+    const probePoll = setInterval(() => {
+      if (caps().tts) {
+        clearInterval(probePoll)
+      } else {
+        void probeCapabilities().then(() => store.getState().setVoice(currentVoiceName()))
+      }
+    }, 2000)
     const warming = warm().catch((err: Error) => s.setError(err.message))
 
     if (!usingBridge && !env.anthropicKey) {
@@ -513,6 +549,7 @@ export default function App() {
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
     await probeCapabilities()
+    store.getState().setVoice(currentVoiceName())
 
     // One voice loop, started once, running until the page closes.
     voice.current = await startVoice({

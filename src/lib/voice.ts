@@ -78,7 +78,7 @@ const WAKE_DEBOUNCE = 1500
  * indication why. Better a rare false wake than a name that does not answer.
  */
 const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+  /\b(?:hey|hi|hello|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
@@ -600,6 +600,25 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
  * assistant that keeps listening.
  */
 function startBrowserVoice(h: VoiceHandlers): Voice {
+  if (
+    typeof navigator !== 'undefined' &&
+    (Boolean((navigator as any).brave) || navigator.userAgent.includes('Brave'))
+  ) {
+    if (typeof (navigator as any).brave?.isBrave === 'function') {
+      void (navigator as any).brave.isBrave().then((isBrave: boolean) => {
+        if (isBrave) {
+          h.onError(
+            'Brave blocks Google Speech Recognition by default. Please open http://localhost:5173 in Google Chrome or Microsoft Edge.',
+          )
+        }
+      })
+    } else {
+      h.onError(
+        'Brave blocks Google Speech Recognition by default. Please open http://localhost:5173 in Google Chrome or Microsoft Edge.',
+      )
+    }
+  }
+
   const Ctor =
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
@@ -774,6 +793,12 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
         stopped = true
         diag.running = false
         h.onError('Microphone access was refused — voice input is unavailable.')
+      } else if (ev.error === 'network') {
+        stopped = true
+        diag.running = false
+        h.onError(
+          'Speech recognition network error — Brave and some browsers block the Google Speech service. Please open in Google Chrome or Microsoft Edge.',
+        )
       }
     }
     rec.onend = () => {

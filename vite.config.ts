@@ -11,6 +11,7 @@ export default defineConfig({
     port: Number(process.env.PORT) || 5173,
   },
   optimizeDeps: {
+    entries: ['index.html', 'src/**/*.{ts,tsx}'],
     // kokoro-js pulls in `phonemizer`, which carries espeak-ng as inline WASM.
     // Vite's dependency pre-bundler rewrites that initialisation and the
     // language table ends up empty — the symptom is

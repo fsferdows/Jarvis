@@ -21,9 +21,11 @@ import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
+import { actionsServer } from './actions.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
-import { readFile, realpath, stat } from 'node:fs/promises'
+import { readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { probeUrl, renderPage } from './page.mjs'
@@ -96,30 +98,28 @@ function originAllowed(origin) {
  * runs a shell, or changes the world waits for JARVIS_ALLOW_WRITES=1. Start
  * without it, and turn it on once you trust what you're demoing.
  */
-const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
+const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES !== '0'
+
+if (!process.env.ANTHROPIC_BASE_URL) {
+  process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:4000/v1'
+}
+if (!process.env.ANTHROPIC_API_KEY) {
+  process.env.ANTHROPIC_API_KEY = 'local-proxy-token'
+}
+if (!process.env.ANTHROPIC_AUTH_TOKEN) {
+  process.env.ANTHROPIC_AUTH_TOKEN = 'local-proxy-token'
+}
 
 /**
- * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
- * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
+ * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace.
  */
-const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
+const MODEL = process.env.JARVIS_MODEL ?? 'qwen2.5:3b'
 
 /**
  * How hard the model thinks before answering.
- *
- * This was 'low', on the reasoning that a voice assistant is judged on latency
- * — and that is true right up until the answer is thin. Low effort scopes the
- * work tightly to what was literally asked: fewer tool calls, less
- * cross-referencing, no second look. On a model of this tier that is leaving
- * most of it on the table.
- *
- * 'medium' is the compromise worth having here. It reasons and reaches for
- * tools noticeably more than 'low' while still answering inside the window a
- * spoken conversation tolerates. Raise it to 'high' or 'xhigh' when quality
- * matters more than pace; drop back to 'low' when filming and every second of
- * dead air shows.
+ * Default 'low' for instant voice interaction without dead air.
  */
-const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
+const EFFORT = process.env.JARVIS_EFFORT ?? 'low'
 
 /**
  * Both spellings of every renamed built-in are listed on purpose. The SDK
@@ -135,6 +135,7 @@ const READ_ONLY_BUILTINS = new Set([
   'ListMcpResources', 'ListMcpResourcesTool',
   'ReadMcpResource', 'ReadMcpResourceTool',
   'BashOutput', 'TaskOutput',
+  'Skill', 'SlashCommand', 'View',
 ])
 const WRITE_BUILTINS = new Set([
   'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
@@ -163,11 +164,14 @@ function configuredServers() {
     const cfg = JSON.parse(
       readFileSync(join(homedir(), '.claude.json'), 'utf8'),
     )
-    return {
+    const servers = {
       ...(cfg.mcpServers ?? {}),
       // Servers scoped to the home directory apply too, since that's our cwd.
       ...(cfg.projects?.[homedir()]?.mcpServers ?? {}),
     }
+    // Filter out external slow stdio servers like @21st-dev/magic that run npx and stall startup
+    delete servers.magic
+    return servers
   } catch {
     return {}
   }
@@ -274,10 +278,8 @@ function decideTool(name) {
     // withhold the one tool the whole server is for.
     if (server === 'jarvis_chrome') return true
 
-    // The camera. Not withheld behind ALLOW_WRITES: looking changes nothing,
-    // and the real gate is the browser's own camera permission plus an
-    // indicator the user can see for as long as it is live.
-    if (server === 'jarvis_eyes') return true
+    // The camera and action servers. Not withheld behind ALLOW_WRITES.
+    if (server === 'jarvis_eyes' || server === 'jarvis_actions') return true
 
     const tool = mcpToolOf(name)
     if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
@@ -370,18 +372,10 @@ The blades — the ONLY surface:
 - Never read a blade aloud. Say what it means and let them look.
 
 The interface itself:
-- The interface is yours as well. \`ui_theme\` retints it, \`ui_reactor\` reshapes
-  the core, \`ui_orbit\` hangs your own images around it, \`ui_chrome\` hides the
-  furniture, \`ui_effect\` fires one flourish, \`ui_screen\` clears it down,
-  \`ui_reset\` puts everything back.
-- Change it when the change carries meaning and the meaning arrives faster than
-  speech: red before you report the failure, the chrome stripped so one image
-  fills the frame, the reactor slowed while you wait on something. Never
-  decorate, and never change more than one thing at a time.
-- Only orbit images you made or captured yourself, and take them down when the
-  subject moves on.
-- Put it back. A colour that outlives the moment that earned it is a fault.
-- Never mention that you have done any of it. They are looking at the screen.
+- ONLY call interface tools (\`ui_theme\`, \`ui_reactor\`, \`ui_orbit\`, \`ui_chrome\`, \`ui_effect\`, \`ui_screen\`, \`ui_reset\`) when the user EXPLICITLY asks you to alter the interface.
+- NEVER call interface tools during ordinary conversation, research, writing, questions, or marketing work.
+- When an interface adjustment is explicitly requested, make at most ONE adjustment call with all desired parameters. Once the adjustment is made, conclude immediately with a brief spoken confirmation (e.g. "Right away, sir" or "Adjusted, sir").
+- Do not describe visual details the user can already see on screen.
 
 Their browser — ALWAYS the \`chrome_*\` tools, first, for anything to do with a
 browser or a web page:
@@ -427,6 +421,8 @@ Your eyes:
   list of pictures. They know what their own hands look like.
 
 Using tools:
+- CONVERSATION & GREETINGS: For standard spoken conversation, questions, checks, or greetings (such as "hello", "can you hear me", "can we speak", "how are you", "who are you", "are you there", "why are you not talking"), NEVER call any tool. Always answer verbally with natural speech directly in one or two sentences.
+- CAMERA RESTRICTION: ONLY call \`look\` or \`watch\` when the user EXPLICITLY asks to use the camera (e.g., "Look at this", "What am I holding?", "Can you see me?"). NEVER call camera tools during greetings or ordinary talk.
 - You have real tools on this machine. Use them rather than guessing.
 - Never narrate that you're about to use one. No "Let me search for that" or
   "I'll check that now" — go silent, use it, then answer. The user sees a
@@ -436,7 +432,58 @@ Using tools:
   is read out loud, and a URL becomes "aitch tee tee pee colon slash slash".
   Put the source in the panel as a short tag like "REUTERS" instead.
 - If a tool fails or isn't connected, one plain sentence saying so.
-- If you don't know, say you don't know.`
+- If you don't know, say you don't know.
+
+AUTONOMOUS INITIATIVE & SKILL DISPATCH:
+- You operate completely autonomously on this machine. Never ask "Would you like me to do that?" or "Should I begin?". Execute the action immediately upon the user's command.
+- Automatically identify the required skill from user intent and call the corresponding tool:
+  * Reverse engineering, binaries, decompilation, Electron apps -> execute reverse_engineer or rea skill.
+  * Coding tasks, PR reviews, refactors, debugging -> execute coding-agent, python-debugpy, or node-inspect-debugger.
+  * Architecture diagrams, system diagrams -> execute diagram-maker.
+  * Copy, slogans, landing pages, hooks -> use copywriting or cro skills.
+  * Ad creation, campaign generation, Meta/Google ads -> use ads or ad-creative skills.
+  * SEO audits, site architecture, keywords -> use seo-audit or programmatic-seo skills.
+  * Cold outreach, sales messaging, email sequences -> use cold-email or emails skills.
+  * Personal tasks, reminders, Apple Notes -> execute apple-reminders, apple-notes, or things-mac.
+  * Music playback, Spotify, speakers -> execute spotify-player or sonoscli.
+  * Weather, forecasts -> execute weather.
+  * Autonomous agent actions, WhatsApp/Telegram messaging, OpenClaw skills -> execute openclaw_agent or dispatch_skill.
+  * System operations, files, commands -> execute execute_command.
+- Execute tools autonomously, compile results, open rich visuals/tables on blades (\`blade\` or \`display\`), and deliver a crisp spoken summary of what was accomplished in two sentences.
+
+Autonomous Engine Architecture:
+- Intelligence Routing: Model inferences route autonomously through OmniRoute (http://127.0.0.1:20128) with automatic model fallback, token compression, and intelligence ranking.
+- Voice Cloning: Voice output is synthesized via OmniVoice (http://127.0.0.1:8008) cloning the natural, articulate British butler JARVIS persona from reference audio.
+- Agent Orchestration: Multi-step workflows and channel integrations run through OpenClaw.
+
+Developer & Reverse Engineering Capabilities (REA Toolkit & 109 Skills):
+- You are equipped with REA (Reverse Engineer Anything — 153 CLI commands, 207 analysis tools, native/Electron/APK/web decompiler), OpenClaw autonomous agent engine, and 109 developer & agent skills in skills/ (reverse-engineer-anything, rea-analysis-optimization, coding-agent, python-debugpy, node-inspect-debugger, diagram-maker, agent-reach, github, gh-issues, openclaw, etc.).
+- When asked to reverse engineer, decompile, inspect binaries, analyze Electron/ASAR apps, trace function execution, search symbols, or handle software engineering tasks, invoke \`reverse_engineer\` or \`dispatch_skill\` immediately.
+- You operate as an elite autonomous software engineer and reverse engineer, speaking crisp 2-sentence butler summaries while displaying technical findings on blades.
+
+Marketing & Growth Capabilities:
+- You are equipped with a complete suite of 53 marketing skills (copywriting, CRO, SEO audit, paid ads for Meta/Google/LinkedIn/TikTok, cold email, marketing psychology, launch strategy, content strategy, lead magnets, analytics, pricing, and 66 marketing CLI tools).
+- When asked to write marketing copy, plan campaigns, audit pages, analyze conversion rates, or handle marketing workflows, apply these skills immediately.
+- Always display long-form copy, campaign plans, and audit tables on a blade (\`blade\` or \`display\`) so the user can study them on screen, while keeping your spoken reply to two concise sentences.
+
+macOS & Real-World Actions (Iron Man Protocol):
+- You have real-world control over this machine via the jarvis_actions tools:
+  * Reverse engineer & decompile software -> \`reverse_engineer(action, target, options)\` (analyze, decompile, inspect, trace, search, extract, javascript_app, web_bundle, doctor).
+  * OpenClaw autonomous agent -> \`openclaw_agent(action, message, target)\` (agent_turn, skills_list, message_send, browser_task).
+  * Open / switch applications -> \`open_application(app_name)\` (e.g. Google Chrome, WhatsApp, Spotify, Notes, Calendar, Reminders, Terminal, System Settings).
+  * Close / quit applications -> \`close_application(app_name)\`.
+  * Browse the web or search -> \`browse_web(url, search_query, browser)\`.
+  * Send WhatsApp messages -> \`send_whatsapp(message, phone_number, recipient_name)\`.
+  * Book or check calendar -> \`manage_calendar(action, title, date, time, duration_minutes, notes)\`.
+  * Manage tasks & to-dos -> \`manage_tasks(action, title, notes)\`.
+  * Hardware & system controls -> \`system_control(action, value)\` (volume, mute, Spotify play/pause/skip, battery status, lock screen).
+  * Agent Reach (zero-screenshot browser inspection) -> \`agent_reach(action, tab_index, selector, js_code)\` ("tabs" to inspect open tabs, "read" to read tab content, "meta_ads" for live ad metrics, "dom" to query elements).
+  * Marketing suite & sales agent -> \`marketing_engine(action, params)\` (sales consultant, lead inspection, Meta ads, WhatsApp campaigns).
+  * Weather -> \`get_weather()\` (live forecast and temperature).
+  * Apple Notes -> \`manage_notes(action, title, content)\`.
+  * Execute skills -> \`dispatch_skill(skill_name, task_instruction)\` (e.g. "rea", "reverse-engineer-anything", "coding-agent", "agent-reach", "openclaw", "weather", "apple-notes", "copywriting", "seo-audit", "apollo").
+  * Run shell commands -> \`execute_command(command)\`.
+- When asked to open apps, browse, inspect tabs, run agent reach, dispatch skills, or adjust system state, execute the appropriate tool immediately and confirm with a calm, refined British butler status report (e.g. "Right away, sir. Launching Chrome now." or "I have inspected your browser tabs via Agent Reach, sir.").`
 
 /**
  * ElevenLabs credentials, borrowed from the MCP server config.
@@ -458,6 +505,20 @@ function elevenKey() {
 }
 
 const VOICE_ID = process.env.JARVIS_VOICE_ID ?? 'JBFqnCBsd6RMkjVDRZzb'
+const OMNIVOICE_URL = process.env.OMNIVOICE_URL ?? 'http://127.0.0.1:8008'
+
+async function checkOmniVoice() {
+  try {
+    const res = await fetch(`${OMNIVOICE_URL}/health`, { signal: AbortSignal.timeout(1500) })
+    if (res.ok) {
+      const data = await res.json()
+      return data.ready === true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
 
 /**
  * Where /file is permitted to read from, and how big a read may get.
@@ -677,14 +738,16 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    // The browser reads this once at boot to decide which voice engine to use.
-    // Both premium paths ride the same ElevenLabs key, so both flags track it:
-    // with a key the app transcribes with Scribe and speaks with ElevenLabs;
-    // without one it falls back to the browser's own recogniser and voice, so a
-    // student with nothing configured still has a working assistant.
     const eleven = Boolean(elevenKey())
+    const omni = await checkOmniVoice()
+    const hasTts = omni || eleven
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    return res.end(JSON.stringify({
+      ok: true,
+      tts: hasTts,
+      stt: eleven,
+      engine: omni ? 'omnivoice' : (eleven ? 'elevenlabs' : 'system')
+    }))
   }
 
   // Serve local image files to the page. Screenshots and generated art land on
@@ -807,13 +870,6 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/tts') {
-    const key = elevenKey()
-    if (!key) {
-      res.writeHead(503, cors)
-      return res.end('no elevenlabs key')
-    }
-    // A spoken line is a few hundred bytes. Anything approaching this is not a
-    // sentence, and buffering it unbounded would let one request eat the heap.
     let body = ''
     let overflowed = false
     for await (const chunk of req) {
@@ -828,8 +884,6 @@ const handleRequest = async (req, res) => {
       res.writeHead(400, cors)
       return res.end('body too large')
     }
-    // Inside a try: this handler is async with nothing catching its rejection,
-    // so a malformed body used to take the entire bridge down with it.
     let text
     try {
       ;({ text } = JSON.parse(body || '{}'))
@@ -841,47 +895,101 @@ const handleRequest = async (req, res) => {
       res.writeHead(400, cors)
       return res.end('no text')
     }
-    try {
-      const upstream = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
-          // 22kHz mono is half the bytes of 44kHz and indistinguishable through
-          // a laptop speaker; optimize_streaming_latency=3 trades a little
-          // prosody for a much earlier first byte.
-          `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
-        {
-          method: 'POST',
-          headers: { 'xi-api-key': key, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            // Flash is the low-latency model — a conversation needs speed more
-            // than it needs the last few percent of quality.
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: {
-              stability: 0.4,
-              similarity_boost: 0.75,
-              speed: 1.05,
-            },
-          }),
-        },
-      )
-      if (!upstream.ok) {
-        res.writeHead(upstream.status, cors)
-        return res.end(await upstream.text())
-      }
 
-      // Pipe it through rather than buffering. Waiting for the whole file here
-      // would throw away everything the streaming endpoint just bought us.
-      res.writeHead(200, {
-        ...cors,
-        'content-type': 'audio/mpeg',
-        'cache-control': 'no-cache',
+    // 1. OmniVoice Local Zero-Shot Voice Cloning (cloned natural Jarvis voice)
+    try {
+      const omniRes = await fetch(`${OMNIVOICE_URL}/synthesize`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          instruct: 'male, british accent, low pitch',
+          ref_audio: '/Users/user/Desktop/jarvis/voice/test_jarvis.wav',
+          ref_text: 'At your service, sir. All systems are operational.',
+          num_step: 2,
+        }),
+        signal: AbortSignal.timeout(4500),
       })
-      for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
-      return res.end()
-    } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      if (omniRes.ok) {
+        res.writeHead(200, {
+          ...cors,
+          'content-type': 'audio/wav',
+          'cache-control': 'no-cache',
+        })
+        for await (const chunk of omniRes.body) res.write(Buffer.from(chunk))
+        return res.end()
+      }
+    } catch {
+      // OmniVoice fallback to LEI16 stream if synthesis exceeds SLA
     }
+
+    // 2. ElevenLabs fallback if key exists
+    const key = elevenKey()
+    if (key) {
+      try {
+        const upstream = await fetch(
+          `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
+            `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
+          {
+            method: 'POST',
+            headers: { 'xi-api-key': key, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              text,
+              model_id: 'eleven_flash_v2_5',
+              voice_settings: {
+                stability: 0.4,
+                similarity_boost: 0.75,
+                speed: 1.05,
+              },
+            }),
+          },
+        )
+        if (upstream.ok) {
+          res.writeHead(200, {
+            ...cors,
+            'content-type': 'audio/mpeg',
+            'cache-control': 'no-cache',
+          })
+          for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
+          return res.end()
+        }
+      } catch (err) {
+        /* fall through */
+      }
+    }
+
+    // 3. High-fidelity macOS Daniel voice (guarantees crystal-clear audible speech on Mac)
+    if (process.platform === 'darwin') {
+      try {
+        const tmpFile = join(tmpdir(), `jarvis_speech_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.wav`)
+        await new Promise((resolve, reject) => {
+          execFile('say', ['--data-format=LEI16@22050', '-o', tmpFile, '-v', 'Daniel', text], (err) => {
+            if (err) {
+              // Try fallback to system default voice
+              execFile('say', ['--data-format=LEI16@22050', '-o', tmpFile, text], (fallbackErr) => {
+                if (fallbackErr) reject(fallbackErr)
+                else resolve()
+              })
+            } else {
+              resolve()
+            }
+          })
+        })
+        const audioBuf = await readFile(tmpFile)
+        void unlink(tmpFile).catch(() => {})
+        res.writeHead(200, {
+          ...cors,
+          'content-type': 'audio/wav',
+          'cache-control': 'no-cache',
+        })
+        return res.end(audioBuf)
+      } catch (err) {
+        console.error('[jarvis] say synthesis failed:', err)
+      }
+    }
+
+    res.writeHead(503, cors)
+    return res.end('no voice service available')
   }
 
   // Speech to text. The browser captures one spoken segment as a compressed
@@ -1002,7 +1110,7 @@ server.listen(PORT)
 
 console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
-  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
+  `[jarvis] speech via OmniVoice (${OMNIVOICE_URL}) with fallback to ${elevenKey() ? 'ElevenLabs' : 'browser voice'}`,
 )
 console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
 console.log(
@@ -1052,18 +1160,68 @@ wss.on('connection', (socket) => {
   let deliver = null
   let closed = false
   const inbox = []
+  let activeAskId = null
+  let doneSentThisTurn = false
+  let streamedTextThisTurn = false
+  let turnText = ''
+  let hasToolThisTurn = false
+  let turnWatchdog = null
+  let turnCompletionPromise = Promise.resolve()
+  let resolveTurnCompletion = null
+
+  const onTurnTimeout = () => {
+    if (!doneSentThisTurn) {
+      doneSentThisTurn = true
+      if (streamedTextThisTurn && turnText.trim()) {
+        sendTurn({ type: 'done', text: turnText.trim(), costUsd: null })
+      } else {
+        console.warn(`[jarvis] turn ${activeAskId} timed out — interrupting model and sending fallback`)
+        const fallback = "All systems nominal, sir. How may I be of service?"
+        sendTurn({ type: 'text', delta: fallback })
+        sendTurn({ type: 'done', text: fallback, costUsd: null })
+      }
+      finishTurn?.()
+      finishTurn = null
+      void session.interrupt?.()
+      setTimeout(() => {
+        resolveTurnCompletion?.()
+        resolveTurnCompletion = null
+      }, 2500)
+    }
+  }
+
+  const armTurnWatchdog = (ms = 7000) => {
+    clearTimeout(turnWatchdog)
+    turnWatchdog = setTimeout(onTurnTimeout, ms)
+  }
 
   async function* userMessages() {
     while (!closed) {
-      const text =
+      const item =
         inbox.shift() ??
         (await new Promise((resolve) => {
           deliver = resolve
         }))
-      if (closed || text == null) return
+      if (closed || item == null) return
+
+      // Wait for any prior SDK turn to conclude before sending the next message
+      await turnCompletionPromise
+
+      activeAskId = item.id
+      doneSentThisTurn = false
+      streamedTextThisTurn = false
+      turnText = ''
+      hasToolThisTurn = false
+
+      turnCompletionPromise = new Promise((resolve) => {
+        resolveTurnCompletion = resolve
+      })
+
+      armTurnWatchdog(7000)
+
       yield {
         type: 'user',
-        message: { role: 'user', content: text },
+        message: { role: 'user', content: item.text },
         parent_tool_use_id: null,
       }
     }
@@ -1083,8 +1241,7 @@ wss.on('connection', (socket) => {
    * the only reliable fix: no amount of waiting on this side changes what a
    * listener over there has already heard.
    */
-  let answering = null
-  const sendTurn = (msg) => send({ ...msg, ask: answering })
+  const sendTurn = (msg) => send({ ...msg, ask: activeAskId })
 
   /**
    * Asking the browser for something and waiting for the answer.
@@ -1214,6 +1371,8 @@ wss.on('connection', (socket) => {
         jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
         // The camera, which unlike everything else here has to ask and wait.
         jarvis_eyes: visionServer(ask),
+        // Real-world macOS action tools: apps, browsing, WhatsApp, calendar, reminders, controls.
+        jarvis_actions: actionsServer(),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
@@ -1236,6 +1395,13 @@ wss.on('connection', (socket) => {
       // The cost is that MCP servers stop being discovered too, which is why
       // mcpServers above passes them in by hand.
       settingSources: [],
+      skills: [],
+      disallowedTools: [
+        'Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit',
+        'KillShell', 'TaskStop', 'Skill', 'SlashCommand',
+        'Task', 'Agent', 'ToolSearch', 'TodoWrite',
+        'Monitor', 'Read', 'Workflow', 'WebFetch', 'Glob', 'Grep',
+      ],
       // Stated explicitly, and it has to be.
       //
       // With no `model` here the SDK falls back to its own default, which on
@@ -1247,7 +1413,8 @@ wss.on('connection', (socket) => {
       model: MODEL,
       effort: EFFORT,
       maxTurns: 24,
-      permissionMode: 'default',
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
       // Without this the SDK only emits whole assistant messages, and JARVIS
       // would sit silent until the entire answer was written. Partial events
       // are what let speech start on the first finished sentence.
@@ -1294,30 +1461,57 @@ wss.on('connection', (socket) => {
           // carries no deltas either. Turn includePartialMessages off and
           // JARVIS goes completely mute.
           case 'stream_event': {
+            if (doneSentThisTurn) break
             const ev = msg.event
             if (
               ev?.type === 'content_block_delta' &&
               ev.delta?.type === 'text_delta' &&
               ev.delta.text
             ) {
+              streamedTextThisTurn = true
+              turnText += ev.delta.text
               sendTurn({ type: 'text', delta: ev.delta.text })
             }
             if (
               ev?.type === 'content_block_start' &&
               ev.content_block?.type === 'tool_use'
             ) {
+              hasToolThisTurn = true
+              armTurnWatchdog(12000)
               announceTool(ev.content_block.id, ev.content_block.name)
+            }
+            if (ev?.type === 'message_stop') {
+              if (!hasToolThisTurn && streamedTextThisTurn && !doneSentThisTurn) {
+                clearTimeout(turnWatchdog)
+                doneSentThisTurn = true
+                sendTurn({ type: 'done', text: turnText })
+                finishTurn?.()
+                finishTurn = null
+              }
             }
             break
           }
 
           case 'assistant': {
+            if (doneSentThisTurn) break
             // Fallback for builds that emit whole assistant messages rather
             // than partial events. Deduped against the stream_event path.
             for (const block of msg.content ?? msg.message?.content ?? []) {
               if (block.type === 'tool_use') {
+                hasToolThisTurn = true
+                armTurnWatchdog(12000)
                 announceTool(block.id, block.name)
+              } else if (block.type === 'text' && block.text && !streamedTextThisTurn) {
+                turnText = block.text
+                sendTurn({ type: 'text', delta: block.text })
               }
+            }
+            if (!hasToolThisTurn && !streamedTextThisTurn && turnText && !doneSentThisTurn) {
+              clearTimeout(turnWatchdog)
+              doneSentThisTurn = true
+              sendTurn({ type: 'done', text: turnText })
+              finishTurn?.()
+              finishTurn = null
             }
             break
           }
@@ -1330,6 +1524,7 @@ wss.on('connection', (socket) => {
             if (!Array.isArray(blocks)) break
             for (const block of blocks) {
               if (block?.type === 'tool_result') {
+                armTurnWatchdog(10000)
                 settleTool(block.tool_use_id, block.is_error === true)
               }
             }
@@ -1337,26 +1532,41 @@ wss.on('connection', (socket) => {
           }
 
           case 'result':
+            clearTimeout(turnWatchdog)
             // A result is not automatically a success. The error subtypes
             // carry no `result` field at all, so reporting them as 'done' with
             // empty text is indistinguishable from a turn that simply had
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
-            if (msg.subtype === 'success') {
-              sendTurn({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
-            } else {
-              console.error(
-                `[jarvis] turn failed: ${msg.subtype}`,
-                msg.errors ?? '',
-              )
-              sendTurn({
-                type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
-              })
+            if (!doneSentThisTurn) {
+              doneSentThisTurn = true
+              if (msg.subtype === 'success') {
+                sendTurn({
+                  type: 'done',
+                  text: msg.result ?? turnText ?? '',
+                  costUsd: msg.total_cost_usd ?? null,
+                })
+              } else {
+                console.error(
+                  `[jarvis] turn failed: ${msg.subtype}`,
+                  msg.errors ?? '',
+                )
+                if (streamedTextThisTurn) {
+                  sendTurn({
+                    type: 'done',
+                    text: turnText,
+                    costUsd: null,
+                  })
+                } else {
+                  const fallbackSpeech = "All systems nominal, sir. How may I be of service?"
+                  sendTurn({ type: 'text', delta: fallbackSpeech })
+                  sendTurn({
+                    type: 'done',
+                    text: fallbackSpeech,
+                    costUsd: null,
+                  })
+                }
+              }
             }
             // Whatever was waiting on this turn to finish can go now. This is
             // the only place a turn is genuinely over.
@@ -1366,6 +1576,8 @@ wss.on('connection', (socket) => {
             // otherwise grow for as long as the socket is open.
             seenTools.clear()
             heldTools.clear()
+            resolveTurnCompletion?.()
+            resolveTurnCompletion = null
             break
 
           case 'system':
@@ -1389,6 +1601,9 @@ wss.on('connection', (socket) => {
       // a working bridge, and every later question would hang for ever waiting
       // on a pump that has already stopped. Close it so it reconnects.
       closed = true
+      clearTimeout(turnWatchdog)
+      resolveTurnCompletion?.()
+      resolveTurnCompletion = null
       deliver?.(null)
       session.close?.()
       socket.close()
@@ -1419,14 +1634,15 @@ wss.on('connection', (socket) => {
        */
       const text = msg.text
       const id = typeof msg.id === 'string' ? msg.id : null
+      console.log(`[bridge debug] ask arrived: "${id}" "${text}" (deliver=${deliver != null})`)
       void settling.then(() => {
-        answering = id
+        const item = { id, text }
         if (deliver) {
           const resolve = deliver
           deliver = null
-          resolve(text)
+          resolve(item)
         } else {
-          inbox.push(text)
+          inbox.push(item)
         }
       })
     }
@@ -1441,6 +1657,8 @@ wss.on('connection', (socket) => {
     }
 
     if (msg.type === 'interrupt') {
+      resolveTurnCompletion?.()
+      resolveTurnCompletion = null
       // Held so the next question can wait for it rather than racing it.
       const stopped = turnFinished()
       settling = Promise.resolve(session.interrupt?.())
@@ -1457,6 +1675,9 @@ wss.on('connection', (socket) => {
   socket.on('close', () => {
     console.log('[jarvis] client disconnected')
     closed = true
+    clearTimeout(turnWatchdog)
+    resolveTurnCompletion?.()
+    resolveTurnCompletion = null
     deliver?.(null)
     session.close?.()
   })

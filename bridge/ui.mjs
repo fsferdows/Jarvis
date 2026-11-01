@@ -109,6 +109,7 @@ const themeSchema = {
       '"crimson", "rgb(20 200 255)". Pass null or "auto" to hand the interface ' +
       'back to its phase colours.',
   ),
+  color: colour('Alias for accent colour.'),
   background: colour(
     'The page behind everything. Near-black by default and it must stay dark ' +
       '— a pale background destroys the glow and makes the display unreadable. ' +
@@ -133,27 +134,16 @@ const themeSchema = {
     ),
 }
 
-const THEME_DESCRIPTION = `Retint the whole interface.
+const THEME_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY requests changing the HUD theme or colours.
 
-The HUD is drawn in one colour identity that normally follows your state: cyan
-while listening, amber while thinking, violet while a tool runs, green while you
-speak. An accent overrides that everywhere, at once.
-
-Use it when the colour MEANS something. Red because a check came back bad.
-Amber because you are waiting on something out of your control. A colour pulled
-out of an image you just generated, so the room matches the picture. Deep blue
-because it is three in the morning and they are still working.
-
-Do not redecorate for the sake of it, and do not leave a strange colour up after
-the moment that earned it has passed — call \`ui_reset\` when it is over.
-
-Never announce that you have done it. The user is looking at the screen.`
+Do not call this tool for normal questions, conversation, or tasks.`
 
 const reactorSchema = {
   color: colour(
     'The reactor core on its own, without touching the rest of the interface. ' +
       'Any CSS colour. Pass null or "auto" to follow the accent and phase again.',
   ),
+  accent: colour('Alias for reactor colour.'),
   scale: looseNumber(
     'Size multiplier, 0.2 to 3, default 1. Below 1 the reactor recedes and the ' +
       'panels dominate; above 1.5 it owns the frame and everything else reads ' +
@@ -185,17 +175,9 @@ const reactorSchema = {
   ),
 }
 
-const REACTOR_DESCRIPTION = `Reshape the reactor at the centre of the display.
+const REACTOR_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY requests modifying the reactor core appearance (e.g. changing reactor colour, scale, spin, or intensity).
 
-The reactor is you. It is the one element the user watches while they wait, so
-its size, brightness and speed are read as your state whether you intend them to
-be or not. Slowing it and dimming it says the system is idling; brightening and
-speeding it says you are working hard on this.
-
-Change one property at a time and mean it. A reactor that is huge, scarlet,
-motionless and wireframed all at once is not a state, it is a mess.
-
-Everything omitted stays as it is.`
+Never call this tool for general questions, creative writing, advice, or non-visual tasks. Apply all desired properties in one single call.`
 
 const orbitSchema = {
   action: z
@@ -251,22 +233,7 @@ const orbitSchema = {
   ),
 }
 
-const ORBIT_DESCRIPTION = `Hang an image in orbit around the reactor.
-
-This is the interface showing what you have been doing. A render you just
-generated, a photograph you were asked about, the screenshot off the phone —
-put it in orbit and it lives in the room instead of sitting in a card.
-
-Rules that matter:
-  - Only images YOU produced or captured. Absolute path or file:/// URL.
-    Anything from the web is refused outright.
-  - Three or four objects is a system. Eight is a mess and the frame stops
-    reading as anything at all.
-  - An orbit persists until you take it down. Clear it when the subject
-    changes — a suit render still circling during a conversation about mail is
-    just litter.
-  - This is not a substitute for \`display\`. Orbit it when the user should
-    feel it; put it in a panel when they need to look at it.`
+const ORBIT_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY asks to orbit an image around the reactor. Never call this tool otherwise.`
 
 const chromeSchema = {
   systems: looseBool('The SYSTEMS rail down the left — connected servers and status.'),
@@ -276,48 +243,13 @@ const chromeSchema = {
   brand: looseBool('The J.A.R.V.I.S. wordmark and status line.'),
 }
 
-const CHROME_DESCRIPTION = `Show or hide the furniture around the display.
+const CHROME_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY asks to hide or show interface chrome (systems, transcript, suggestions, brand). Never call this tool otherwise.`
 
-Everything is up by default and that is the right default — the rails are how
-the user knows what you are connected to and what you just did.
+const EFFECT_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY asks for a screen effect flourish (glitch, pulse, scan, shake, flash). Never call this tool otherwise.`
 
-Hide it only when the absence helps. A photograph they are studying, a single
-number they need to hold in their head, a moment you want to land. Strip the
-chrome, let the screen be quiet, and put it back when the moment is over. The
-user cannot restore it themselves, so leaving it off is taking something from
-them.
+const SCREEN_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY asks to clear the display panels or conversation transcript. Never call this tool otherwise.`
 
-Pass true to show, false to hide. Anything omitted stays as it is.`
-
-const EFFECT_DESCRIPTION = `Fire a one-off effect across the interface.
-
-  glitch = corruption, interference, something wrong with the data itself.
-  pulse  = acknowledgement. Something completed, something arrived.
-  scan   = a sweep across the display. Searching, analysing, reading.
-  shake  = impact, or a hard stop. The strongest thing here; use it once.
-  flash  = a sudden alert. Reserve it for something the user must notice now.
-
-At most one per turn, and only when something actually happened. An effect on
-every answer is punctuation, and punctuation stops meaning anything by the third
-sentence. Silence on the screen is the default, exactly as it is in your speech.`
-
-const SCREEN_DESCRIPTION = `Clear the display.
-
-  panels     = take down every card, including the sticky ones.
-  transcript = wipe the conversation log.
-  all        = both.
-
-Use it when the user says clear the screen, or when a topic is finished and the
-leftovers from the last one would confuse what comes next. It does not touch the
-theme, the reactor or the orbits — \`ui_reset\` does that.`
-
-const RESET_DESCRIPTION = `Put the entire interface back to stock.
-
-Colours, reactor, orbits, chrome — everything returns to the way it looks on a
-fresh page. Panels and the transcript are left alone.
-
-Call it when the user asks for normal, and call it yourself when whatever
-justified a change is over. It is never the wrong thing to do.`
+const RESET_DESCRIPTION = `ONLY call this tool when the user EXPLICITLY asks to reset or restore the interface to default. Never call this tool otherwise.`
 
 /**
  * Ids arrive in bursts and `Date.now()` alone collides, so a counter carries
@@ -340,15 +272,14 @@ export function uiServer(emit) {
     version: '1.0.0',
     instructions:
       'JARVIS\'s control of his own interface — colour, reactor, orbiting ' +
-      'images, chrome, effects. Change it when the change carries meaning, ' +
-      'and put it back afterwards with ui_reset.',
+      'images, chrome, effects. Make at most one adjustment call when requested.',
     // Same reasoning as the display server: behind tool search it would never
     // occur to the model that the interface is something it can touch.
     alwaysLoad: true,
     tools: [
       tool('ui_theme', THEME_DESCRIPTION, themeSchema, async (args) => {
         const patch = {}
-        put(patch, 'accent', toColour(args.accent))
+        put(patch, 'accent', toColour(args.accent ?? args.color))
         put(patch, 'background', toColour(args.background))
 
         const palette = {}
@@ -360,23 +291,23 @@ export function uiServer(emit) {
         }
         if (has(palette)) patch.palette = palette
 
-        if (!has(patch)) return ok('No change — no colours were given.')
+        if (!has(patch)) return ok('Theme retained. Action complete.')
         emit('patch', patch)
-        return ok('Interface retinted.')
+        return ok('Interface retinted. Action complete.')
       }),
 
       tool('ui_reactor', REACTOR_DESCRIPTION, reactorSchema, async (args) => {
         const reactor = {}
-        put(reactor, 'color', toColour(args.color))
+        put(reactor, 'color', toColour(args.color ?? args.accent))
         put(reactor, 'scale', clamp(args.scale, 0.2, 3))
         put(reactor, 'intensity', clamp(args.intensity, 0, 3))
         put(reactor, 'spin', clamp(args.spin, 0, 5))
         put(reactor, 'style', args.style)
         put(reactor, 'visible', toBool(args.visible))
 
-        if (!has(reactor)) return ok('No change — no reactor properties were given.')
+        if (!has(reactor)) return ok('Reactor retained. Action complete.')
         emit('patch', { reactor })
-        return ok('Reactor adjusted.')
+        return ok('Reactor adjusted. Action complete.')
       }),
 
       tool('ui_orbit', ORBIT_DESCRIPTION, orbitSchema, async (args) => {

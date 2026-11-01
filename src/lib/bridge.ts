@@ -144,8 +144,7 @@ let attempt = 0
 let reconnectTimer = 0
 
 function scheduleReconnect() {
-  if (attempt >= RECONNECT_DELAYS.length) return
-  const delay = RECONNECT_DELAYS[attempt]
+  const delay = attempt < RECONNECT_DELAYS.length ? RECONNECT_DELAYS[attempt] : 5000
   attempt += 1
   clearTimeout(reconnectTimer)
   reconnectTimer = window.setTimeout(() => {
@@ -303,12 +302,10 @@ export async function warmBridge(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * No frame of any kind for two minutes means the turn is never coming back.
- * Generous on purpose: a long agent run can sit silent through a slow tool,
- * and cutting a real answer off is worse than waiting. What this catches is
- * the case that used to hang forever — the bridge alive but the turn lost.
+ * No frame of any kind for 8 seconds means the turn is taking too long.
+ * Fail fast so the user is never stuck in PROCESSING.
  */
-const IDLE_TIMEOUT_MS = 120_000
+const IDLE_TIMEOUT_MS = 8_000
 
 /** The turn in flight, so a barge-in can settle it locally. */
 let pending: { finish: (fallback?: string) => void } | null = null
